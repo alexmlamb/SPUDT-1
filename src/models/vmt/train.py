@@ -13,19 +13,18 @@ def soft_cross_entropy(preds, soft_targets):
     return torch.sum(-F.softmax(soft_targets, 1)*F.log_softmax(preds, 1), 1)
 
 
-def classification_loss(data, classes, classifier):
-    pred = classifier(data)
+def classification_loss(emb, classes, classifier):
+    pred = classifier.mlp(emb).squeeze()
     return F.cross_entropy(pred, classes)
 
-
-def classification_target_loss(data, classifier):
-    preds = classifier(data)
+def classification_target_loss(emb, classifier):
+    preds = classifier.mlp(emb).squeeze()
     return soft_cross_entropy(preds, preds).mean()
 
 
 def disc_loss(data1, data2, discriminator, embedding, classifier, device):
-    emb1 = embedding(data1).detach()
-    emb2 = embedding(data2).detach()
+    emb1 = embedding(data1,run_mlp=False).detach()
+    emb2 = embedding(data2,run_mlp=False).detach()
     c1 = classifier(emb1).detach()
     c2 = classifier(emb2).detach()
     pos_dis = discriminator(emb1, c1)
@@ -37,11 +36,11 @@ def disc_loss(data1, data2, discriminator, embedding, classifier, device):
     return 0.5*pos_loss + 0.5*neg_loss
 
 
-def embed_div_loss(data1, data2, discriminator, embedding, classifier, device):
-    emb1 = embedding(data1)
-    emb2 = embedding(data2)
-    c1 = classifier(emb1)
-    c2 = classifier(emb2)
+def embed_div_loss(emb1, emb2, discriminator, embedding, classifier, device):
+    #emb1 = embedding(data1,run_mlp=False)
+    #emb2 = embedding(data2,run_mlp=False)
+    c1 = classifier.mlp(emb1).squeeze()
+    c2 = classifier.mlp(emb2).squeeze()
     pos_dis = discriminator(emb1, c1)
     neg_dis = discriminator(emb2, c2)
     zeros = torch.zeros_like(pos_dis, device=device)
@@ -50,14 +49,14 @@ def embed_div_loss(data1, data2, discriminator, embedding, classifier, device):
     neg_loss = F.binary_cross_entropy_with_logits(neg_dis, ones)
     return 0.5*pos_loss + 0.5*neg_loss
 
-
 def compute_perturb(x, y, radius, classifier, device):
     eps = 1e-6 * F.normalize(torch.randn_like(x, device=device))
     eps.requires_grad=True
     xe = x + eps
-    ye = classifier(xe)
-    loss = soft_cross_entropy(ye, y)
-    grad = torch.autograd.grad(loss, eps, grad_outputs=torch.ones_like(loss, device=device),
+    ye = classifier(xe).contiguous()
+    loss = soft_cross_entropy(ye, y).contiguous()
+
+    grad = torch.autograd.grad(loss, eps, grad_outputs=torch.ones_like(loss, device=device).contiguous(),
                                create_graph=True, retain_graph=True, only_inputs=True)[0]
     grad = F.normalize(grad)
     x_prime = radius*grad + x
@@ -65,6 +64,7 @@ def compute_perturb(x, y, radius, classifier, device):
 
 
 def vat_loss(x, classifier, radius, device):
+    #y = classifier.mlp(emb).squeeze().contiguous()
     y = classifier(x)
     x_prime = compute_perturb(x, y, radius, classifier, device)
     y_prime = classifier(x_prime)
@@ -77,6 +77,7 @@ def mixup_loss(x, classifier, device):
     alphay = alpha.view(-1, 1)
     idx = torch.randperm(len(x), device=device)
     x2 = x[idx]
+    #y = classifier.mlp(emb).squeeze()
     y = classifier(x)
     y2 = y[idx]
 
@@ -151,21 +152,21 @@ def train(args):
             data2 = batchy[0].to(args.device)
 
         optim_discriminator.zero_grad()
-        d_loss = disc_loss(data1, data2, discriminator, classifier.x, classifier.mlp, args.device)
+        d_loss = disc_loss(data1, data2, discriminator, classifier, classifier.mlp, args.device)
         d_loss.backward()
         optim_discriminator.step()
 
         optim_classifier.zero_grad()
-        c_loss = classification_loss(data1, label, classifier)
-        tcw_loss = classification_target_loss(data2, classifier)
-        dw_loss = embed_div_loss(data1, data2, discriminator, classifier.x, classifier.mlp, args.device)
+        emb1 = classifier(data1,run_mlp=False)
+        emb2 = classifier(data2,run_mlp=False)
+        c_loss = classification_loss(emb1, label, classifier)
+        tcw_loss = classification_target_loss(emb2, classifier)
+        dw_loss = embed_div_loss(emb1, emb2, discriminator, classifier, classifier, args.device)
+        (args.cw*c_loss + args.tcw*tcw_loss + args.dw*dw_loss).backward()
         v_loss1 = vat_loss(data1, classifier, args.radius, args.device)
         v_loss2 = vat_loss(data2, classifier, args.radius, args.device)
         m_loss1 = mixup_loss(data1, classifier, args.device)
         m_loss2 = mixup_loss(data2, classifier, args.device)
-        (args.cw *c_loss)  .backward()
-        (args.tcw*tcw_loss).backward()
-        (args.dw *dw_loss) .backward()
         (args.svw*v_loss1) .backward()
         (args.tvw*v_loss2) .backward()
         (args.smw*m_loss1) .backward()

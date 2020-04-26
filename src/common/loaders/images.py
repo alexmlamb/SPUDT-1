@@ -8,7 +8,7 @@ import errno
 import os
 import os.path
 import numpy as np
-from torchvision.datasets.utils import download_url, makedir_exist_ok
+from torchvision.datasets.utils import download_url#, makedir_exist_ok
 from torch.utils.model_zoo import tqdm
 import torch
 from torchvision import datasets, transforms
