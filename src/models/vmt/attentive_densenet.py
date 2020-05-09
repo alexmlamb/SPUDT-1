@@ -30,6 +30,28 @@ import torch
 import torch.nn as nn
 import numpy
 
+class SpaceToDepth(nn.Module):
+    def __init__(self, block_size):
+        super(SpaceToDepth, self).__init__()
+        self.block_size = block_size
+        self.block_size_sq = block_size*block_size
+
+    def forward(self, input):
+
+        output = input.permute(0, 2, 3, 1)
+        (batch_size, s_height, s_width, s_depth) = output.size()
+        d_depth = s_depth * self.block_size_sq
+        d_width = int(s_width / self.block_size)
+        d_height = int(s_height / self.block_size)
+        t_1 = output.split(self.block_size, 2)
+        stack = [t_t.reshape(batch_size, d_height, d_depth) for t_t in t_1]
+        output = torch.stack(stack, 1)
+        output = output.permute(0, 2, 1, 3)
+        output = output.permute(0, 3, 1, 2)
+        output = output.reshape((output.shape[0], self.block_size_sq, output.shape[1]//self.block_size_sq, output.shape[2], output.shape[3]))
+        output = output.permute(1,0,2,3,4)
+        return output
+
 class SparseAttention(nn.Module):
     def __init__(self, top_k = 3):
         super(SparseAttention,self).__init__()
@@ -67,8 +89,8 @@ class ScaledDotProductAttention(nn.Module):
         if att_sparsity is None:
             self.use_sparse = False
         else:
-            self.use_sparse = True
             self.sa = SparseAttention(top_k=att_sparsity)
+            self.use_sparse = True
 
         self.dropout = nn.Dropout(dropout)
 
@@ -99,11 +121,16 @@ class ScaledDotProductAttention(nn.Module):
         return output, attn
 
 class AttentiveDensenet(nn.Module):
-    def __init__(self, layer_channels, key_size, val_size, n_heads, att_sparsity=3,attn_dropout=0.0,concentration=0.5):
+    def __init__(self, layer_channels, key_size, val_size, n_heads, att_sparsity=None,attn_dropout=0.0,concentration=0.5, position_attend=True):
         super(AttentiveDensenet, self).__init__()
 
         print('concentration?',  concentration)
 
+        print('position attend?', position_attend)
+
+        print('attn_dropout', attn_dropout)
+
+        self.position_attend = position_attend
         self.layer_channels = layer_channels
         self.key_size = key_size
         self.val_size = val_size
@@ -121,7 +148,7 @@ class AttentiveDensenet(nn.Module):
             self.key_layers.append(nn.Conv2d(ch, key_size*n_heads,1,stride=1,padding=0))
             self.query_layers.append(nn.Conv2d(ch, key_size*n_heads,1,stride=1,padding=0))
             self.val_layers.append(nn.Conv2d(ch, val_size*n_heads,1,stride=1,padding=0))
-            out_layer = nn.Sequential(nn.Conv2d(val_size*n_heads,val_size*n_heads,1,stride=1,padding=0), nn.BatchNorm2d(val_size*n_heads,momentum=0.99, eps=1e-3), nn.LeakyReLU(0.1, inplace=True), nn.Conv2d(val_size*n_heads, ch,1,stride=1,padding=0))
+            out_layer = nn.Sequential(nn.Conv2d(val_size*n_heads,ch,3,stride=1,padding=1), nn.BatchNorm2d(ch), nn.ReLU(), nn.Conv2d(ch, ch, 3,stride=1,padding=1))
             #out_layer = nn.Conv2d(val_size*n_heads, ch, 1)
             self.out_layers.append(out_layer)
             self.gammas.append(nn.Parameter(torch.tensor(0.0)))
@@ -133,6 +160,8 @@ class AttentiveDensenet(nn.Module):
         self.gammas = nn.ParameterList(self.gammas)
 
         self.layer_index = None
+
+        
 
         self.attn = ScaledDotProductAttention(np.power(key_size, concentration),att_sparsity=att_sparsity,dropout=attn_dropout)
 
@@ -162,42 +191,48 @@ class AttentiveDensenet(nn.Module):
         query = h_query.reshape((sz_b,self.n_heads,self.key_size,h,w)).permute(0,3,4,1,2).reshape((sz_b*h*w*self.n_heads, 1, self.key_size)) #sz_b, h, w, n_heads key_size
 
         #print('key shape', key.shape)
-        #print('query shape', query.shape)
+        #print('query shape', h_query.shape)
         
         vals_reshaped = []
         keys_reshaped = []
-
 
         for ind in range(len(self.val_lst)):
 
             val = self.val_lst[ind]
             key = self.key_lst[ind]
-
-
+            
             if val is None:
                 assert key is None
                 continue
 
-            val_resized = F.interpolate(val, (h,w), mode='nearest')
-            key_resized = F.interpolate(key, (h,w), mode='nearest')
+            #print('init val size', val.shape)
 
-            #if h > val.shape[2]:
-            #    #upsample
-            #    val_resized = F.interpolate(val, (h,w), mode='nearest')
-            #    key_resized = F.interpolate(key, (h,w), mode='nearest')
-            #else:
-                #downsample
-            #    maxpool = nn.AvgPool2d((val.shape[2]//h, val.shape[2]//h))
-            #    val_resized = maxpool(val)
-            #    key_resized = maxpool(key)
+            if self.position_attend and val.shape[2] > h:
+                #print('downsample!', val.shape, 'to', h)
+                #print('space 2 depth')
+                val_resized = SpaceToDepth(val.shape[2]//h)(val)
+                key_resized = SpaceToDepth(key.shape[2]//h)(key)
 
-            val_resized = val_resized.reshape((sz_b, self.n_heads,self.val_size,h,w)).permute(0,3,4,1,2).reshape((sz_b*h*w*self.n_heads, 1, self.val_size))#.repeat(1,self.n_heads,1,1)
+                #print('std', down_val.shape) #([4, 64, 128, 16, 16]) pos x bs x ch x h x w
+            else:
+                #print('interpolate resize')
+                val_resized = F.interpolate(val, (h,w), mode='nearest').unsqueeze(0)
+                key_resized = F.interpolate(key, (h,w), mode='nearest').unsqueeze(0)
+
+            #print('val resized shape', val_resized.shape)
+
+            n_pos = val_resized.shape[0]
+            val_resized = val_resized.reshape((n_pos, sz_b, self.n_heads,self.val_size,h,w)).permute(1,4,5,2,0,3).reshape((sz_b*h*w*self.n_heads, n_pos, self.val_size))#.repeat(1,self.n_heads,1,1)
             vals_reshaped.append(val_resized)
-            key_old = key_resized.reshape((sz_b,self.n_heads,self.key_size,h,w)).permute(0,3,4,1,2).reshape((sz_b*h*w*self.n_heads, 1, self.key_size))
+            key_old = key_resized.reshape((n_pos, sz_b,self.n_heads,self.key_size,h,w)).permute(1,4,5,2,0,3).reshape((sz_b*h*w*self.n_heads, n_pos, self.key_size))
             keys_reshaped.append(key_old)
 
         vals_tensor = torch.cat(vals_reshaped, dim = 1)
         keys_tensor = torch.cat(keys_reshaped, dim = 1)
+
+        #print('shape vals tensor', vals_tensor.shape)
+
+        #print('vals tensor shape', vals_tensor.shape)
 
         #print('query shape', query.shape)
         #print('vals tensor shape', vals_tensor.shape)
@@ -205,6 +240,8 @@ class AttentiveDensenet(nn.Module):
 
         keys_tensor = torch.cat([keys_tensor, torch.zeros_like(keys_tensor[:,0:1])], dim=1)
         vals_tensor = torch.cat([vals_tensor, torch.zeros_like(vals_tensor[:,0:1])], dim=1)
+
+        #print('shape vals tensor null', vals_tensor.shape)
 
         att_out,iatt = self.attn(query, keys_tensor, vals_tensor)
 
@@ -222,7 +259,7 @@ class AttentiveDensenet(nn.Module):
 if __name__ == "__main__":
     channels = [3,64,64,128,256]
 
-    ad = AttentiveDensenet(channels, 32, 32, 4)
+    ad = AttentiveDensenet(channels, 32, 32, 4, att_sparsity=None)
 
     ad.reset()
 
@@ -237,8 +274,7 @@ if __name__ == "__main__":
 
         layerx = torch.randn(64, ch, h, h)
 
-        inp_out = ad(layerx)
-
+        inp_out = ad(layerx, read=True, write=True)
 
 
 

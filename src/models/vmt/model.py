@@ -1,7 +1,9 @@
 import torch
 from torch import nn
 
-from src.models.vmt.attentive_densenet import AttentiveDensenet
+from models.vmt.attentive_densenet import AttentiveDensenet
+
+#from attentive_densenet import AttentiveDensenet
 
 class Discriminator(nn.Module):
     def __init__(self, i_dim, kernel_dim, h_dim, nc, **kwargs):
@@ -50,7 +52,7 @@ class Classifier(nn.Module):
         if use_nfl:
 
             cf = 1
-            self.ad = AttentiveDensenet([h_dim//cf, h_dim//cf, h_dim//cf, h_dim//cf, h_dim//cf, h_dim//cf] + [h_dim, h_dim, h_dim, h_dim, h_dim],8,32,2).cuda()
+            self.ad = AttentiveDensenet([h_dim//cf, h_dim//cf, h_dim//cf, h_dim//cf, h_dim//cf, h_dim//cf] + [h_dim, h_dim, h_dim, h_dim, h_dim],16,16,4, att_sparsity=None,attn_dropout=0.0).cuda()
 
             self.x1_b = nn.Sequential(nn.InstanceNorm2d(3),
                                nn.Conv2d(i_dim, h_dim//cf, 3, 1, 1),
@@ -166,17 +168,17 @@ class Classifier(nn.Module):
 
         o = self.x1(o)
         if self.use_nfl:
-            o = self.ad(o, write=False, read=True)
+            o = self.ad(o, write=True, read=True)
         o = self.x2(o)
         if self.use_nfl:
-            o = self.ad(o, write=False, read=True)
+            o = self.ad(o, write=True, read=True)
         o = self.x3(o)
         if self.use_nfl:
-            o = self.ad(o, write=False, read=True)
+            o = self.ad(o, write=True, read=True)
         o = o.contiguous()
         o = self.x4(o)
         if self.use_nfl:
-            o = self.ad(o, write=False, read=True)
+            o = self.ad(o, write=True, read=True)
         o = self.x5(o)
         if self.use_nfl:
             o = self.ad(o, write=False, read=True)
